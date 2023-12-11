@@ -1,0 +1,467 @@
+package main
+
+import (
+	"fmt"
+	"github.com/aceld/zinx/ziface"
+	"github.com/aceld/zinx/znet"
+	"os"
+	"strconv"
+	"time"
+	"strings"
+	"encoding/json"
+	"net/http"
+	"go.dedis.ch/kyber/v3/pairing/bn256"
+	"go.dedis.ch/kyber/v3/share"
+	"go.dedis.ch/kyber/v3/sign/bls"
+	"go.dedis.ch/kyber/v3/sign/tbls"
+	"go.dedis.ch/kyber/v3"
+	//"rand"
+	"crypto/sha256"
+	"sync"
+)
+
+var FIRST_LEADER = 0
+const F = 1
+const REGISTER = 0
+var RUNNING = false
+var ADDRESS = ""
+var REPLICAS = map[int]*Replica{}
+var NODE_NUM = -1
+var REGISTER_ADDRESS = "127.0.0.1:8000"
+var PUBKEYS []*share.PubShare
+var MY_PRIKEY *share.PriShare
+var PUBKEY *share.PubPoly
+var MY_PUBKEY *share.PubShare
+var PROPOSALS = make([][]*Proposal, 3 * F + 1)
+var mtx1 sync.RWMutex //for REPLICAS
+var mtx2 sync.RWMutex //for PROPOSALS
+
+type Proposal struct{
+	Msg *PrePrepareMsg
+	Hash [32]byte
+	State int
+	PrepareMsgs map[int]*SigMsg
+	PreCommitMsgs map[int]*SigMsg
+	TSig1 []byte
+	Tsig2 []byte
+}
+
+type Replica struct{
+	Address string
+	Conn ziface.IClient
+}
+
+type RegisterMsg struct{
+	SenderId int
+	Address string
+}
+
+type PrePrepareMsg struct{
+	MsgId int
+	Data []byte
+}
+
+type VoteMsg struct{
+	LeaderId int
+	MsgId int
+	Phase int
+	Hash []byte
+}
+
+type SigMsg struct{
+	SenderId int
+	Type string
+	Data []byte
+	Sig []byte
+}
+
+func hash(data []byte) []byte{
+	hash := sha256.New()
+	hash.Write(data)
+	return hash.Sum(nil)
+}
+
+func cryptoInit(){
+	n := 3 * F + 1
+	t := 2 * F + 1
+	suite := bn256.NewSuite()
+	coeffs := make([]kyber.Scalar, t)
+	for i := 0;i < t;i++{
+		coeffs[i]=suite.G2().Scalar().SetInt64(int64(i))
+	}
+	priPoly := share.CoefficientsToPriPoly(suite.G2(),coeffs)
+	pubPoly := priPoly.Commit(suite.G2().Point().Base())
+	PUBKEY = pubPoly
+	prikeys := priPoly.Shares(n)
+	MY_PRIKEY = prikeys[NODE_NUM]
+	pubkeys := pubPoly.Shares(n)
+	PUBKEYS = pubkeys
+	MY_PUBKEY = pubkeys[NODE_NUM]
+}
+
+func register(){
+	var f = func(conn ziface.IConnection){
+		msg := RegisterMsg{NODE_NUM, ADDRESS}
+		jsonStr, err := json.Marshal(msg)
+		if err != nil {
+			fmt.Println("marshal failed!")
+			return
+		}
+		err = conn.SendBuffMsg(1, []byte(jsonStr))
+		err = conn.SendMsg(1, []byte(jsonStr))
+		if err == nil{
+			fmt.Println("注册成功")
+		}else{
+			fmt.Println("注册失败")
+		}
+	}
+	
+	arr := strings.Split(REGISTER_ADDRESS, ":")
+	ip := arr[0]
+	port, _ := strconv.Atoi(arr[1])
+	
+	client := znet.NewClient(ip, port)
+	client.SetOnConnStart(f)
+	client.Start()
+	
+	mtx1.Lock()
+	REPLICAS[REGISTER] = &Replica{REPLICAS[REGISTER].Address, client}
+	mtx1.Unlock()
+}
+
+
+func mainLoop(){
+	Id := 0
+	for ;;{
+		if RUNNING && NODE_NUM == FIRST_LEADER{
+			newPrePrepareMsg := PrePrepareMsg{Id, []byte("hello" + strconv.Itoa(NODE_NUM))}
+			newPrePrepareJson, _ := json.Marshal(newPrePrepareMsg)
+			newPrePrepareHash := hash([]byte(newPrePrepareJson))
+			suite := bn256.NewSuite()
+			newPrePrepareSig, err := tbls.Sign(suite, MY_PRIKEY, newPrePrepareHash)
+			if err != nil{
+				fmt.Println("签名失败(mainLoop)")
+				continue
+			}
+			sigMsg := SigMsg{NODE_NUM, "PrePrepare", []byte(newPrePrepareJson), newPrePrepareSig}
+			sigMsgJson, _ := json.Marshal(sigMsg)
+			sigMsgByte := []byte(sigMsgJson)
+			
+			voteMsg := VoteMsg{NODE_NUM, Id, 1, newPrePrepareHash}
+			voteJson, _ := json.Marshal(voteMsg)
+			voteHash := hash([]byte(voteJson))
+			voteSig, err := tbls.Sign(suite, MY_PRIKEY, voteHash)
+			if err != nil{
+				fmt.Println("签名失败(mainLoop)")
+				continue
+			}
+			prepareMsg := SigMsg{NODE_NUM, "Prepare", []byte(voteJson), voteSig}
+			tempArr := [32]byte{}
+			copy(tempArr[:], newPrePrepareHash)
+			mtx2.Lock()
+			PROPOSALS[NODE_NUM] = append(PROPOSALS[NODE_NUM], &Proposal{&newPrePrepareMsg, tempArr, 0, map[int]*SigMsg{NODE_NUM: &prepareMsg}, map[int]*SigMsg{}, []byte{}, []byte{}})
+			mtx2.Unlock()
+			
+			bdMsg(3, sigMsgByte)
+			
+			Id++
+			fmt.Println("发送PrePrepare消息：", newPrePrepareHash)
+			time.Sleep(5*time.Second)
+		}
+	}
+}
+
+func bdNodes(){
+	mtx1.RLock()
+	if NODE_NUM != REGISTER || len(REPLICAS) != 3 * F + 1{
+		mtx1.RUnlock()
+		return
+	}
+	addresses := make([]string, 3 * F + 1)
+	for id, replica := range REPLICAS{
+		addresses[id] = replica.Address
+	}
+	fmt.Println("全体节点的地址为:", addresses)
+	jsonStr, _ := json.Marshal(addresses)
+	
+	var f = func(conn ziface.IConnection){
+		err := conn.SendBuffMsg(2, []byte(jsonStr))
+		err = conn.SendBuffMsg(2, []byte(jsonStr))
+		if err != nil{
+			fmt.Println("注册失败")
+		}
+	}
+	
+	for id, replica := range REPLICAS{
+		if id != REGISTER{
+			fmt.Println("向地址为", replica.Address, "的节点", id, "发送全体节点的地址")
+			conn := replica.Conn
+			conn.SetOnConnStart(f)
+			conn.Start()
+		}
+	}
+	mtx1.RUnlock()
+}
+
+func bdMsg(router uint32, data []byte){
+	mtx1.RLock()
+	for id, replica := range REPLICAS{
+		if id != NODE_NUM{
+			conn := replica.Conn.Conn()
+			sendMsg(conn, router, data)
+		}
+	}
+	mtx1.RUnlock()
+}
+
+func sendMsg(conn ziface.IConnection, router uint32, data []byte){
+	err := conn.SendBuffMsg(router, data)
+	if err != nil{
+		fmt.Println("发送PB消息失败(sendMsg)")
+	}
+}
+
+type RegisterRouter struct {
+	znet.BaseRouter
+}
+
+func (r *RegisterRouter) Handle(request ziface.IRequest) {
+	jsonStr := string(request.GetData())
+	msg := RegisterMsg{}
+	err := json.Unmarshal([]byte(jsonStr), &msg)
+	if err != nil {
+		fmt.Println("unmarshal failed in RegisterRouter!")
+		return
+	}
+	
+	fmt.Println("connect from node ", msg.SenderId, " with address ", msg.Address)
+	
+	arr := strings.Split(msg.Address, ":")
+	ip := arr[0]
+	port, _ := strconv.Atoi(arr[1])
+	client := znet.NewClient(ip, port)
+	mtx1.Lock()
+	REPLICAS[msg.SenderId] = &Replica{msg.Address, client}
+	mtx1.Unlock()
+	
+	mtx1.RLock()
+	fmt.Println("目前已有", len(REPLICAS), "个节点完成注册")
+	if len(REPLICAS) == 3 * F + 1{
+		bdNodes()
+		fmt.Println("全部", len(REPLICAS), "个节点完成注册,可启动协议")
+	}
+	mtx1.RUnlock()
+}
+
+type BDNodesRouter struct {
+	znet.BaseRouter
+}
+
+func (r *BDNodesRouter) Handle(request ziface.IRequest){
+	jsonStr := string(request.GetData())
+	addresses := make([]string, 3 * F + 1)
+	err := json.Unmarshal([]byte(jsonStr), &addresses)
+	if err != nil {
+		fmt.Println("unmarshal failed in BDNodesRouter!")
+		return
+	}
+	fmt.Println("收到Register广播的全部节点地址:", addresses)
+	mtx1.Lock()
+	for i := 0;i < len(addresses);i++{
+		if i != NODE_NUM && i != REGISTER{
+			arr := strings.Split(addresses[i], ":")
+			ip := arr[0]
+			port, _ := strconv.Atoi(arr[1])
+			client := znet.NewClient(ip, port)
+			client.Start()
+			REPLICAS[i] = &Replica{addresses[i], client}
+		}
+	}
+	mtx1.Unlock()
+}
+
+type PBRouter struct {
+	znet.BaseRouter
+}
+
+func (r *PBRouter) Handle(request ziface.IRequest){
+	jsonStr := string(request.GetData())
+	msg := SigMsg{}
+	err := json.Unmarshal([]byte(jsonStr), &msg)
+	if err != nil {
+		fmt.Println("unmarshal failed in PBRouter!")
+		return
+	}
+	
+	hashValue := hash(msg.Data)
+	fmt.Println("收到消息:", hashValue)
+	
+	if !handlePbMsg(msg){
+		fmt.Println("处理消息失败:", hashValue)
+	}
+}
+
+func handlePbMsg(msg SigMsg)bool{
+	suite := bn256.NewSuite()
+	hashValue := hash(msg.Data)
+	err := bls.Verify(suite, PUBKEYS[msg.SenderId].V, hashValue, msg.Sig[2:])
+	if err != nil{
+		fmt.Println("签名验证失败(handlePbMsg)")
+		return false
+	}
+	
+	if msg.Type == "PrePrepare"{
+		if msg.SenderId != FIRST_LEADER{
+			fmt.Println("消息发送者的身份错误(handlePbMsg)")
+			return false
+		}
+		
+		newPrePrepareMsg := PrePrepareMsg{}
+		err := json.Unmarshal([]byte(msg.Data), &newPrePrepareMsg)
+		if err != nil {
+			fmt.Println("unmarshal failed in handlePbMsg()!")
+			return false
+		}
+		
+		mtx2.Lock()
+		for newPrePrepareMsg.MsgId >= len(PROPOSALS[msg.SenderId]){
+			PROPOSALS[msg.SenderId] = append(PROPOSALS[msg.SenderId], &Proposal{nil, [32]byte{}, -1, map[int]*SigMsg{}, map[int]*SigMsg{}, []byte{}, []byte{}})
+		}
+		
+		if PROPOSALS[msg.SenderId][newPrePrepareMsg.MsgId].State != -1{
+			mtx2.Unlock()
+			return true
+		}else{
+			PROPOSALS[msg.SenderId][newPrePrepareMsg.MsgId].Msg = &newPrePrepareMsg
+			PROPOSALS[msg.SenderId][newPrePrepareMsg.MsgId].State = 0
+			tempArr := [32]byte{}
+			copy(tempArr[:], hashValue)
+			PROPOSALS[msg.SenderId][newPrePrepareMsg.MsgId].Hash = tempArr
+		}
+		mtx2.Unlock()
+		
+		voteMsg := VoteMsg{msg.SenderId, newPrePrepareMsg.MsgId, 1, hashValue}
+		voteJson, _ := json.Marshal(voteMsg)
+		voteHash := hash([]byte(voteJson))
+		voteSig, err := tbls.Sign(suite, MY_PRIKEY, voteHash)
+		if err != nil{
+			fmt.Println("签名失败(handlePbMsg)")
+			return false
+		}
+		prepareMsg := SigMsg{NODE_NUM, "Prepare", []byte(voteJson), voteSig}
+		prepareMsgJson, _ := json.Marshal(prepareMsg)
+		
+		mtx1.RLock()
+		conn := REPLICAS[FIRST_LEADER].Conn.Conn()
+		sendMsg(conn, 3, []byte(prepareMsgJson))
+		mtx1.RUnlock()
+		if err != nil{
+			fmt.Println("发送PB消息失败(handlePbMsg)")
+			return false
+		}
+	}else if msg.Type == "Prepare"{
+		fmt.Println("开始处理Prepare消息")
+		prepareMsg := VoteMsg{}
+		err := json.Unmarshal(msg.Data, &prepareMsg)
+		if err != nil {
+			fmt.Println("unmarshal failed in handlePbMsg!")
+			return false
+		}
+		mtx2.RLock()
+		if prepareMsg.MsgId >= len(PROPOSALS[prepareMsg.LeaderId]){
+			fmt.Println("无效的Prepare消息(handlePbMsg)")
+			mtx2.RUnlock()
+			return false
+		}
+		if PROPOSALS[prepareMsg.LeaderId][prepareMsg.MsgId].State > 0{
+			fmt.Println("Prepare阶段已结束")
+			mtx2.RUnlock()
+			return true
+		}
+		prePrepareMsgJson, _ := json.Marshal(PROPOSALS[prepareMsg.LeaderId][prepareMsg.MsgId].Msg)
+		prePrepareMsgHash := hash([]byte(prePrepareMsgJson))
+		tempArr := [32]byte{}
+		copy(tempArr[:], prePrepareMsgHash)
+		if tempArr != PROPOSALS[prepareMsg.LeaderId][prepareMsg.MsgId].Hash{
+			fmt.Println("无效的Prepare消息(handlePbMsg)")
+			mtx2.RUnlock()
+			return false
+		}
+		mtx2.RUnlock()
+		mtx2.Lock()
+		PROPOSALS[prepareMsg.LeaderId][prepareMsg.MsgId].PrepareMsgs[msg.SenderId] = &msg
+		if len(PROPOSALS[prepareMsg.LeaderId][prepareMsg.MsgId].PrepareMsgs) >= 2 * F + 1{
+			PROPOSALS[prepareMsg.LeaderId][prepareMsg.MsgId].State = 1
+			sigs := make([][]byte, len(PROPOSALS[prepareMsg.LeaderId][prepareMsg.MsgId].PrepareMsgs))
+			i := 0
+			for _, msg := range PROPOSALS[prepareMsg.LeaderId][prepareMsg.MsgId].PrepareMsgs{
+				sigs[i] = msg.Sig
+				i++
+			}
+			tSig, _ := tbls.Recover(suite, PUBKEY, hashValue, sigs, 2 * F + 1, 3 * F + 1)
+			PROPOSALS[prepareMsg.LeaderId][prepareMsg.MsgId].TSig1 = tSig
+			prepareCommitMsg := SigMsg{NODE_NUM, "PrepareCommit", msg.Data, tSig}
+			prepareCommitMsgJson, _ := json.Marshal(prepareCommitMsg)
+			bdMsg(3, []byte(prepareCommitMsgJson))
+			fmt.Println("发送tsig1")
+		}
+		mtx2.Unlock()
+		fmt.Println("Prepare消息处理结束")
+	}else if msg.Type == "PrepareCommit"{
+		fmt.Println("开始处理PrepareCommit消息")
+		fmt.Println("PrepareCommit消息处理结束")
+	}
+	return true
+}
+
+func SwitchHandler(w http.ResponseWriter, r *http.Request) {
+    RUNNING = !RUNNING
+	fmt.Fprintln(w, "hello world")
+}
+
+func main() {
+	if len(os.Args) != 3{
+		fmt.Println("参数数量错误")
+		return
+	}
+	num, err := strconv.Atoi(os.Args[1])
+	if err != nil{
+		fmt.Println("节点号码必须是数字")
+		return
+	}
+	if num >= 3 * F + 1 || num < 0{
+		fmt.Println("节点号码错误")
+		return
+	}
+	NODE_NUM = num
+	ADDRESS = os.Args[2]
+	arr := strings.Split(ADDRESS, ":")
+	ip := arr[0]
+	port, err := strconv.Atoi(arr[1])
+	if err != nil{
+		fmt.Println("端口必须是数字")
+		return
+	}
+	
+	fmt.Println("节点号:", NODE_NUM, " 地址:", ADDRESS)
+	cryptoInit()
+	
+	REPLICAS[REGISTER] = &Replica{}
+	REPLICAS[REGISTER].Address = REGISTER_ADDRESS
+	if NODE_NUM != REGISTER{
+		register()
+	}
+	
+	go mainLoop()
+	
+	go func(){
+		http.HandleFunc("/switch", SwitchHandler)
+		http.ListenAndServe("127.0.0.1:" + strconv.Itoa(port - 1000), nil)
+	}()
+	
+	s := znet.NewServer2(ip, port)
+	s.AddRouter(1, &RegisterRouter{})
+	s.AddRouter(2, &BDNodesRouter{})
+	s.AddRouter(3, &PBRouter{})
+	s.Serve()
+}
